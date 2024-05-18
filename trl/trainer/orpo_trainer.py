@@ -432,29 +432,29 @@ class ORPOTrainer(Trainer):
             bos_token_id = self.tokenizer.bos_token_id
 
             # C/R prompt + answer
-            if len(chosen_tokens["prompt_input_ids"]) == 0 or bos_token_id != chosen_tokens["prompt_input_ids"][0]:
+            if len(chosen_tokens["prompt_input_ids"]) == 0 or bos_token_id not in chosen_tokens["prompt_input_ids"]:
                 chosen_tokens["prompt_input_ids"] = [bos_token_id] + chosen_tokens["prompt_input_ids"]
                 chosen_tokens["prompt_attention_mask"] = [1] + chosen_tokens["prompt_attention_mask"]
-            if len(rejected_tokens["prompt_input_ids"]) == 0 or bos_token_id != rejected_tokens["prompt_input_ids"][0]:
+            if len(rejected_tokens["prompt_input_ids"]) == 0 or bos_token_id not in rejected_tokens["prompt_input_ids"]:
                 rejected_tokens["prompt_input_ids"] = [bos_token_id] + rejected_tokens["prompt_input_ids"]
                 rejected_tokens["prompt_attention_mask"] = [1] + rejected_tokens["prompt_attention_mask"]
 
             # C/R prompt
-            if len(prompt_chosen_tokens["prompt_input_ids"]) == 0 or bos_token_id != prompt_chosen_tokens["prompt_input_ids"][0]:
+            if len(prompt_chosen_tokens["prompt_input_ids"]) == 0 or bos_token_id not in prompt_chosen_tokens["prompt_input_ids"]:
                 prompt_chosen_tokens["prompt_input_ids"] = [bos_token_id] + prompt_chosen_tokens["prompt_input_ids"]
                 prompt_chosen_tokens["prompt_attention_mask"] = [1] + prompt_chosen_tokens["prompt_attention_mask"]
-            if len(prompt_rejected_tokens["prompt_input_ids"]) == 0 or bos_token_id != prompt_rejected_tokens["prompt_input_ids"][0]:
+            if len(prompt_rejected_tokens["prompt_input_ids"]) == 0 or bos_token_id not in prompt_rejected_tokens["prompt_input_ids"]:
                 prompt_rejected_tokens["prompt_input_ids"] = [bos_token_id] + prompt_rejected_tokens["prompt_input_ids"]
                 prompt_rejected_tokens["prompt_attention_mask"] = [1] + prompt_rejected_tokens["prompt_attention_mask"]
 
             eos_token_id = self.tokenizer.eos_token_id
-            if len(chosen_tokens["input_ids"]) == 0 or eos_token_id != chosen_tokens["input_ids"][-1]:
+            if len(chosen_tokens["input_ids"]) == 0 or eos_token_id not in chosen_tokens["input_ids"]:
                 chosen_tokens["input_ids"].append(eos_token_id)
                 chosen_tokens["attention_mask"].append(1)
-            if len(rejected_tokens["input_ids"]) == 0 or eos_token_id != rejected_tokens["input_ids"][-1]:
+            if len(rejected_tokens["input_ids"]) == 0 or eos_token_id not in rejected_tokens["input_ids"]:
                 rejected_tokens["input_ids"].append(eos_token_id)
                 rejected_tokens["attention_mask"].append(1)
-            if len(answer_tokens["input_ids"]) == 0 or eos_token_id != answer_tokens["input_ids"][-1]:
+            if len(answer_tokens["input_ids"]) == 0 or eos_token_id not in answer_tokens["input_ids"]:
                 answer_tokens["input_ids"].append(eos_token_id)
                 answer_tokens["attention_mask"].append(1)
 
@@ -495,15 +495,13 @@ class ORPOTrainer(Trainer):
             for k, toks in {
                 "chosen_": chosen_sequence_tokens,
                 "rejected_": rejected_sequence_tokens,
-                #"answer_": answer_tokens,              #TODO: may have to change this in the Transformers function
+                "chosen_prompt_": prompt_chosen_tokens,     # TODO: this has "prompt_" appended to every token
+                "rejected_prompt_": prompt_rejected_tokens, # TODO: this has "prompt_" appended to every token
             }.items():
                 for type_key, tokens in toks.items():
                     if type_key == "token_type_ids":
                         continue
                     batch[f"{k}{type_key}"] = tokens
-                print(batch)
-                import sys
-                sys.exit()
         else: 
             accepted_prompt_tokens = self.tokenizer(
                 prompt_chosen, truncation=True, max_length=self.max_prompt_length, add_special_tokens=True
@@ -595,6 +593,8 @@ class ORPOTrainer(Trainer):
         self,
         policy_chosen_logps: torch.FloatTensor,
         policy_rejected_logps: torch.FloatTensor,
+        policy_chosen_prompt_logps: torch.FloatTensor,
+        policy_rejected_prompt_logps: torch.FloatTensor,
     ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
         """Compute ORPO's odds ratio (OR) loss for a batch of policy and reference model log probabilities.
 
@@ -613,7 +613,7 @@ class ORPOTrainer(Trainer):
         # Derived from Eqs. (4) and (7) from https://arxiv.org/abs/2403.07691 by using log identities and exp(log(P(y|x)) = P(y|x)
         log_odds = (policy_chosen_logps - policy_rejected_logps) - (
             torch.log1p(-torch.exp(policy_chosen_logps)) - torch.log1p(-torch.exp(policy_rejected_logps))
-        )
+        ) + (policy_chosen_prompt_logps - policy_rejected_prompt_logps)     # Multiplying p(x+)/p(x-) to equation (5)
         sig_ratio = F.sigmoid(log_odds)
         ratio = torch.log(sig_ratio)
         losses = self.beta * ratio
@@ -663,7 +663,7 @@ class ORPOTrainer(Trainer):
 
     def concatenated_forward(
         self, model: nn.Module, batch: Dict[str, Union[List, torch.LongTensor]]
-    ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
+    ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
         """Run the given model on the given batch of inputs, concatenating the chosen and rejected inputs together.
 
         We do this to avoid doing two forward passes, because it's faster for FSDP.
@@ -728,7 +728,27 @@ class ORPOTrainer(Trainer):
         chosen_logits = all_logits[:len_chosen]
         rejected_logits = all_logits[len_chosen:]
 
-        return (chosen_logps, rejected_logps, chosen_logits, rejected_logits, chosen_nll_loss)
+        # Calculate P_theta(x_w) and P_theta(x_l)
+        chosen_prompt_logps = self.get_batch_logps(
+            chosen_logits,
+            concatenated_batch["concatenated_input_ids"][:len_chosen],
+            average_log_prob=True,
+            is_encoder_decoder=self.is_encoder_decoder,
+            label_pad_token_id=self.label_pad_token_id,
+        )
+
+        rejected_prompt_logps = self.get_batch_logps(
+            rejected_logits,
+            concatenated_batch["concatenated_input_ids"][len_chosen:],
+            average_log_prob=True,
+            is_encoder_decoder=self.is_encoder_decoder,
+            label_pad_token_id=self.label_pad_token_id,
+        )
+
+        return ( chosen_logps , rejected_logps , chosen_logits,
+        rejected_logits , chosen_nll_loss, chosen_prompt_logps, rejected_prompt_logps)
+
+
 
     def get_batch_loss_metrics(
         self,
@@ -745,10 +765,13 @@ class ORPOTrainer(Trainer):
             policy_chosen_logits,
             policy_rejected_logits,
             policy_nll_loss,
+            policy_chosen_prompt_logps,
+            policy_rejected_prompt_logps,
         ) = self.concatenated_forward(model, batch)
 
         losses, chosen_rewards, rejected_rewards, log_odds_ratio, log_odds_chosen = self.odds_ratio_loss(
-            policy_chosen_logps, policy_rejected_logps
+            policy_chosen_logps, policy_rejected_logps, 
+            policy_chosen_prompt_logps, policy_rejected_prompt_logps,
         )
         # full ORPO loss
         loss = policy_nll_loss - losses.mean()
