@@ -728,25 +728,36 @@ class ORPOTrainer(Trainer):
         chosen_logits = all_logits[:len_chosen]
         rejected_logits = all_logits[len_chosen:]
 
-        # Calculate P_theta(x_w) and P_theta(x_l)
+        # Calculate the logprobs of the prompt only
+        len_prompt_chosen = len([k for k in batch['chosen_labels'][0] if k == -100])
+        len_prompt_rejected = len([k for k in batch['rejected_labels'][0] if k == -100])
+        chosen_prompt_labels = batch['chosen_input_ids'][:, :len_prompt_chosen]
+        rejected_prompt_labels = batch['rejected_input_ids'][:, :len_prompt_rejected]
+
+        chosen_prompt_logit = chosen_logits[:, :len_prompt_chosen, :]
+        rejected_prompt_logit = rejected_logits[:, :len_prompt_rejected, :]
+
         chosen_prompt_logps = self.get_batch_logps(
-            chosen_logits,
-            concatenated_batch["concatenated_input_ids"][:len_chosen],
+            chosen_prompt_logit,
+            chosen_prompt_labels,
             average_log_prob=True,
             is_encoder_decoder=self.is_encoder_decoder,
             label_pad_token_id=self.label_pad_token_id,
         )
 
         rejected_prompt_logps = self.get_batch_logps(
-            rejected_logits,
-            concatenated_batch["concatenated_input_ids"][len_chosen:],
+            rejected_prompt_logit,
+            rejected_prompt_labels,
             average_log_prob=True,
             is_encoder_decoder=self.is_encoder_decoder,
             label_pad_token_id=self.label_pad_token_id,
         )
 
-        return ( chosen_logps , rejected_logps , chosen_logits,
-        rejected_logits , chosen_nll_loss, chosen_prompt_logps, rejected_prompt_logps)
+        return ( chosen_logps , rejected_logps , 
+                chosen_logits , rejected_logits , 
+                chosen_nll_loss, 
+                chosen_prompt_logps, rejected_prompt_logps, 
+                chosen_prompt_logit, rejected_prompt_logit)
 
 
 
@@ -767,6 +778,8 @@ class ORPOTrainer(Trainer):
             policy_nll_loss,
             policy_chosen_prompt_logps,
             policy_rejected_prompt_logps,
+            policy_chosen_prompt_logits,
+            policy_rejected_prompt_logits,
         ) = self.concatenated_forward(model, batch)
 
         losses, chosen_rewards, rejected_rewards, log_odds_ratio, log_odds_chosen = self.odds_ratio_loss(
@@ -790,6 +803,10 @@ class ORPOTrainer(Trainer):
         metrics[f"{prefix}nll_loss"] = policy_nll_loss.detach().mean().cpu()
         metrics[f"{prefix}log_odds_ratio"] = log_odds_ratio
         metrics[f"{prefix}log_odds_chosen"] = log_odds_chosen
+        metrics[f"{prefix}logps/chosen_prompt"] = policy_chosen_prompt_logps.detach().mean().cpu()
+        metrics[f"{prefix}logps/rejected_prompt"] = policy_rejected_prompt_logps.detach().mean().cpu()
+        metrics[f"{prefix}logits/chosen_prompt"] = policy_chosen_prompt_logits.detach().mean().cpu()
+        metrics[f"{prefix}logits/rejected_prompt"] = policy_rejected_prompt_logits.detach().mean().cpu()
 
         return loss, metrics
 
